@@ -4,7 +4,9 @@
 
 
 #include <stdio.h>
+#ifndef NO_FFTW
 #include <fftw3.h>
+#endif
 #include <sys/time.h>
 #include <omp.h>
 #include <ninkasi_defs.h>
@@ -83,6 +85,9 @@ struct map_struct_s {
   actData *map;
   int nx,ny;
   long npix;
+#ifdef ACTPOL
+  int pol_state;  //flag to tell me how many polarizations I have.  0/1=I, 2=Q+U, 3=I+Q+U
+#endif
 
   //Stuff for reductions
   int have_locks;
@@ -151,6 +156,8 @@ void get_pointing_vec_new(const mbTOD *tod, const MAP *map, int det, int *ind, P
 void write_tod_pointing_to_disk(const mbTOD *tod, char *fname);
 void mapset2det(const MAPvec *maps, mbTOD *tod, const PARAMS *params, actData *vec, int *ind, int det, PointingFitScratch *scratch);
 void map2tod(const MAP *map, mbTOD *tod,const PARAMS *params);
+void polmap2tod(MAP *map, mbTOD *tod);
+
 void clear_map(MAP *map);
 void clear_tod(mbTOD *tod);
 actData **matrix(long n,long m);
@@ -193,11 +200,25 @@ void tod2mapset(MAPvec *maps, mbTOD *tod, PARAMS *params);
 void assign_tod_value(mbTOD *tod, actData val);
 void free_tod_storage(mbTOD *tod);
 void map2det_scaled(const MAP *map, const mbTOD *tod, actData *vec, actData scale_fac, int *ind, int det, PointingFitScratch *scratch);
+
+int get_map_poltag(const MAP *map);
+int get_npol_in_map(const MAP *map);
+void set_map_polstate(MAP *map, int *pol_state);
+int is_map_polarized(MAP *map);
+
+
 void tod2map(MAP *map, mbTOD *tod, PARAMS *params);
+void tod2polmap(MAP *map,mbTOD *tod);
+void tod2polmap_copy(MAP *map,mbTOD *tod);
+int *tod2map_actpol(MAP *map, mbTOD *tod, int *ipiv_proc);
+
+
 actData tod_times_map(const MAP *map, const mbTOD *tod, PARAMS *params);
 
 int read_tod_data(mbTOD *tod);
 MAP *make_map_copy(MAP *map);
+MAP *deres_map(MAP *map);
+MAP *upres_map(MAP *map);
 
 actData map_times_map(MAP *x, MAP *y);
 void map_axpy(MAP *y, MAP *x, actData a);
@@ -206,11 +227,17 @@ void purge_cut_detectors(mbTOD *tod);
 mbUncut ***get_uncut_regions(mbTOD *tod);
 int get_numel_cut(mbTOD *tod);
 void set_global_indexed_cuts(mbTOD *tod);
+mbCutFitParams ***setup_cut_fit_params(mbTOD *tod, int *nparams_from_length);
+void setup_cutsfits_precon(mbTOD *tod);
+void apply_cutfits_precon(mbTOD *tod, actData *params_in, actData *params_out);
+
+
 mbUncut ***get_cut_regions(mbTOD *tod);
 void get_tod_cut_regions(mbTOD *tod);
 mbUncut ***get_cut_regions_global_index(mbTOD *tod);
 int tod2cutvec(mbTOD *tod, actData *cutvec);
 int cutvec2tod(mbTOD *tod, actData *cutvec);
+
 
 
 void get_tod_uncut_regions(mbTOD *tod);
@@ -234,6 +261,10 @@ int tod_hits_source(actData ra, actData dec, actData dist, mbTOD *tod);
 void add_src2tod(mbTOD *tod, actData ra, actData dec, actData src_amp, const actData *beam, actData dtheta, int nbeam, int oversamp);
 void add_srcvec2tod(mbTOD *tod, actData *ra, actData *dec, actData *src_amp, int nsrc,const actData *beam, actData dtheta, int nbeam, int oversamp);
 void tod2srcvec(actData *src_amp_out,mbTOD *tod, actData *ra_in, actData *dec_in, int nsrc_in,const actData *beam, actData dtheta, int nbeam, int oversamp);
+void find_map_index_limits(MAP *map, mbTOD *tod, int *imin_out, int *imax_out);
+void invert_pol_precon(MAP *map);
+void apply_pol_precon(MAP *map, MAP *precon);
+
 //from ninkasi_projection
 //void get_map_projection(const mbTOD *tod, const MAP *map, int det, int *ind, PointingFitScratch *scratch);
 

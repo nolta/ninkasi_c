@@ -6,6 +6,11 @@
 
 #include <ninkasi_defs.h>
 //#include <ninkasi.h>
+#ifdef ACTPOL
+#include <actpol/actpol.h>
+#endif
+
+
 #include <ps_stuff.h>
 #include <mbCuts.h>
 #include "noise_types.h"
@@ -69,6 +74,38 @@ typedef struct {
   int nclock;
 
 } TiledPointingFit;
+/*--------------------------------------------------------------------------------*/
+#ifdef ACTPOL
+typedef struct {
+  int nhorn;
+
+  actData *dx;
+  actData *dy;
+  actData *theta;
+  actData freq;
+  ACTpolArray *array;
+  actData alt0;
+  actData az0;
+  actData az_throw;
+  ACTpolWeather weather;
+  int *ipiv;
+  int npiv;
+  int dpiv;
+
+
+  actData **ra_piv;
+  actData **dec_piv;
+  actData **sin2gamma_piv;
+  actData **cos2gamma_piv;
+
+  int n_gamma_az_coeffs;
+  actData **gamma_az_cos_coeffs;
+  actData *gamma_ctime_cos_coeffs;
+  actData **gamma_az_sin_coeffs;
+  actData *gamma_ctime_sin_coeffs;
+
+} ACTpolPointingFit;
+#endif
 
 /*--------------------------------------------------------------------------------*/
 
@@ -111,6 +148,8 @@ typedef actArray actFilter;
 
 
 typedef struct {
+  int todtype;
+  void *generic;
   actFilter band;      //!< enum: ACT_145, ACT_215, or ACT_265
   char *dirfile;
 
@@ -124,7 +163,7 @@ typedef struct {
   bool point_absent;   //!< Are the az/alt encoder channels absent from the raw data?
   psS32 *tv_sec;       //!< time (seconds since Unix Epoch)
   psS32 *tv_usec;      //!< time (microseconds since second; 0 <= tv_usec < 1e6)
-  float *dt;           //!< time (seconds since the start of the scan)
+  double *dt;           //!< time (seconds since the start of the scan) 
   float sampleTime;    //!< time (seconds since the start of the scan)
   actData *az;           //!< azimuth of boresight; radians
   actData *alt;          //!< altitude of boresight; radians
@@ -140,6 +179,7 @@ typedef struct {
   int ncol;            //!< dimensions of array; column
   actData **data;      //!< the actual pixel data; use as data[det_number][time_index] 
                        //!< where det_number is the detector index into the rows, cols arrays.
+  actData **calib_facs_saved;  //2D-array where calibration factors for the data are saved.
   int have_data;
   int decimate;        //!< decimate factor - for each value here, apply a factor of 2 decimation to the data.
   int n_to_window;     //!< how many samples at end to cut/window out.
@@ -158,7 +198,10 @@ typedef struct {
   double lon;          //!< longitude of observations
   mbCuts *cuts; //!< cuts that apply to this TOD
   mbUncut ***uncuts;  //!< uncut regions
+  mbUncut ***uncuts_for_interp;  //!< uncut regions
   mbUncut ***cuts_as_uncuts;  //!< cut regions stored using uncuts
+  mbCutFitParams ***cuts_fit_params;  //legendre polynomial coefficients for gapfilling across the cuts
+  
   mbUncut ***cuts_as_vec;  //!< vectorized cut regions for indexing into a global array
   mbUncut ***kept_data; //have a second copy of uncuts in case we wish to project/gapfill different data
   actData **ends;        //!< values at beginning and end of TOD for detrend/retrend
@@ -196,6 +239,14 @@ typedef struct {
   actData *dra;
   actData *ddec;  
   
+#ifdef ACTPOL
+  //ACTpolArray *polarray;
+  //ACTpolWeather weather;  //if there's TOD-based weather info.
+  ACTpolPointingFit *actpol_pointing;
+  actData *hwp;
+  actData **twogamma_saved;
+#endif
+
   PointingFit *pointing_fit;  //pointing fit, turn alt/az into ra/dec
   int **pixelization_saved;  //save a map pixelization in here.  Will break if there are multiple classes of maps with different pixelizations.
   actData **ra_saved;

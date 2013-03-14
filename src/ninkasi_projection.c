@@ -1,5 +1,7 @@
 //Module to turn RA/Dec into map coordinates.
+#ifndef MAKEFILE_HAND
 #include "config.h"
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -42,6 +44,45 @@ static inline actData sin4(actData x)
 }
 #endif
 
+
+/*--------------------------------------------------------------------------------*/
+
+/*--------------------------------------------------------------------------------*/
+void radecvec2cea_pix(const actData *ra, const actData *dec, int *rapix, int *decpix, int *ind, int ndata, const MAP *map)
+{
+  double rafac=RAD2DEG/map->projection->radelt;  //180/pi since ra is in radians, but CEA FITS likes degrees.                                                                                          
+  double decfac=RAD2DEG/map->projection->pv/map->projection->decdelt;
+  actData dra=map->projection->rapix-1+0.5;
+  actData ddec=map->projection->decpix-1+0.5;
+  if ((rapix!=NULL)&&(ind!=NULL)) {
+    assert(decpix!=NULL);
+    for (int i=0;i<ndata;i++) {
+      rapix[i]=ra[i]*rafac+dra;
+      decpix[i]=sin5(dec[i])*decfac+ddec;
+      ind[i]=map->nx*decpix[i]+rapix[i];
+    }
+    return;
+  }
+  if ((rapix!=NULL)&&(ind==NULL))  {
+    assert(decpix!=NULL);
+    for (int i=0;i<ndata;i++) {
+      rapix[i]=ra[i]*rafac+dra;
+      decpix[i]=sin5(dec[i])*decfac+ddec;
+    }
+    return;
+  }
+  if ((rapix==NULL)&&(ind!=NULL)) {
+    for (int i=0;i<ndata;i++) {
+      int tmp_ra=ra[i]*rafac+dra;
+      int tmp_dec=sin5(dec[i])*decfac+ddec;
+      ind[i]=map->nx*tmp_dec+tmp_ra;
+    }
+    return;
+  }
+  assert(1==0);  //should never get here, means we didn't find an appropriate set of jobs to carry out.
+  return;
+
+}
 /*--------------------------------------------------------------------------------*/
 
 void get_map_projection(const mbTOD *tod, const MAP *map, int det, int *ind, PointingFitScratch *scratch)
@@ -88,6 +129,25 @@ void get_map_projection_wchecks(const mbTOD *tod, const MAP *map, int det, int *
     return;
   }
   get_radec_from_altaz_fit_1det_coarse(tod,det,scratch);
+#if 1
+  convert_radec_to_map_pixel(scratch->ra,scratch->dec,ind,tod->ndata,map);
+  if (inbounds) {  //checking map pixellization inboundness
+    printf("checking pixellization.\n");
+    for (int i=0;i<tod->ndata;i++) {
+      if ((ind[i]<0)||(ind[i]>=map->npix)) {
+	fprintf(stderr,"We are going to have a problem at ra/dec %14.6f %14.6f mapped to pixel %d\n",scratch->ra[i],scratch->dec[i],ind[i]);
+	inbounds[i]=false;
+      }
+      else
+	inbounds[i]=true;
+    }
+  }
+  
+  return;
+#endif
+  //printf("using old code.\n");
+
+  //printf("back from get_radec_from_altaz_fit_1det_coarse.\n");
   switch(map->projection->proj_type) {
   case(NK_RECT): 
     //printf("Doing rectangular projection.\n");
@@ -117,7 +177,11 @@ void get_map_projection_wchecks(const mbTOD *tod, const MAP *map, int det, int *
 	if (i>331550)
 	  printf("getting pixel for %14.6f %14.6f\n",scratch->dec[i],scratch->ra[i]);
 	*/
-	ang2pix_ring(map->projection->nside,PI_OVER_TWO-scratch->dec[i],scratch->ra[i],&ind[i]);
+
+	//ang2pix_ring(map->projection->nside,PI_OVER_TWO-scratch->dec[i],scratch->ra[i],&ind[i]);
+	long tmp;
+	ang2pix_ring(map->projection->nside,PI_OVER_TWO-scratch->dec[i],scratch->ra[i],&tmp);
+	ind[i]=tmp;
 	/*
 	if (i>331550)
 	  printf("pixel is %d\n",ind[i]);
@@ -130,7 +194,11 @@ void get_map_projection_wchecks(const mbTOD *tod, const MAP *map, int det, int *
   case(NK_HEALPIX_NEST): 
     for (int i=0;i<tod->ndata;i++) {
       //printf("getting pixel for %14.6f %14.6f\n",scratch->dec[i],scratch->ra[i]);
-      ang2pix_nest(map->projection->nside,PI_OVER_TWO-scratch->dec[i],scratch->ra[i],&ind[i]);
+
+      //ang2pix_nest(map->projection->nside,PI_OVER_TWO-scratch->dec[i],scratch->ra[i],&ind[i]);
+      long tmp;
+      ang2pix_nest(map->projection->nside,PI_OVER_TWO-scratch->dec[i],scratch->ra[i],&tmp);
+      ind[i]=tmp;
       //printf("pixel is %d\n",ind[i]);
       
     }
@@ -140,6 +208,11 @@ void get_map_projection_wchecks(const mbTOD *tod, const MAP *map, int det, int *
   case (NK_CEA):
     {
       //printf("Doing CEA projection.\n");
+#if 1  //use the vectorized call.  This lets you calculate pixels (including x and y) in other places as well
+      radecvec2cea_pix(scratch->ra,scratch->dec, NULL,NULL,ind,tod->ndata,map);
+#else
+      
+      
       double rafac=RAD2DEG/map->projection->radelt;  //180/pi since ra is in radians, but CEA FITS likes degrees.
       double decfac=RAD2DEG/map->projection->pv/map->projection->decdelt;
       for (int i=0;i<tod->ndata;i++) {
@@ -148,6 +221,7 @@ void get_map_projection_wchecks(const mbTOD *tod, const MAP *map, int det, int *
 	//int decpix=sin(scratch->dec[i])*decfac+map->projection->decpix-1+0.5;  //change!  13 Aug 2010, should be faster, good to 1e-3 arcsec
 	ind[i]=map->nx*decpix+rapix;
       }
+#endif
       if (inbounds)
 	{
 	  printf("doing inbounds\n");
@@ -176,16 +250,21 @@ void get_map_projection_wchecks(const mbTOD *tod, const MAP *map, int det, int *
     break;
 
   }
+  //printf("done.\n");
 }
 
 /*--------------------------------------------------------------------------------*/
 void radec2pix_cea(MAP *map, actData ra, actData dec, int *rapix, int *decpix)
 {
+#if 1
+  radecvec2cea_pix(&ra, &dec, rapix, decpix, NULL,1,map);
+#else
   nkProjection *projection=map->projection;
   double rafac=RAD2DEG/map->projection->radelt;
   double decfac=RAD2DEG/map->projection->pv/map->projection->decdelt;
   *rapix=ra*rafac+projection->rapix-1;
   *decpix=sin(dec)*decfac+projection->decpix-1;
+#endif
   
 }
 
@@ -203,7 +282,7 @@ void pix2radec_cea(MAP *map, int rapix, int decpix, actData *ra, actData *dec)
 void pix2radec_tan(MAP *map, int rapix, int decpix, actData *ra, actData *dec)
 {
 
-  printf("ra crap is %14.4e %14.4e %14.4e\n",rapix,map->projection->rapix,map->projection->radelt);
+  printf("ra crap is %d %14.4e %14.4e\n",rapix,map->projection->rapix,map->projection->radelt);
 
   double xx=(rapix-map->projection->rapix)*map->projection->radelt;
   double yy=(decpix-map->projection->decpix)*map->projection->decdelt;
@@ -227,7 +306,7 @@ int set_map_projection_cea_simple( MAP *map)
 
   double cos0=cos(0.5*(map->decmax+map->decmin));
   
-
+  mprintf(stdout,"Map limits in set_map_projection_cea_simple are %14.8f %14.8f %14.8f %14.8f\n",map->ramin,map->ramax,map->decmin,map->decmax);
   map->projection->decdelt=map->pixsize/cos0*RAD2DEG;
   map->projection->radelt= -map->projection->decdelt;
   map->projection->pv=cos0*cos0;
@@ -235,6 +314,7 @@ int set_map_projection_cea_simple( MAP *map)
   actData ra1=map->ramin*RAD2DEG/map->projection->radelt+1;  //+1 is in in case of equality
   actData dec0=sin(map->decmin)*RAD2DEG/map->projection->pv/map->projection->decdelt;
   actData dec1=sin(map->decmax)*RAD2DEG/map->projection->pv/map->projection->decdelt+1;  //+1 is in case of equality
+  mprintf(stdout,"Before rounding, ra0/dec0 are %14.8f %14.8f\n",ra0,dec0);
   map->projection->rapix=-(int)ra0;
   map->projection->decpix=-(int)dec0;
   map->nx=ra1-ra0;
@@ -243,8 +323,8 @@ int set_map_projection_cea_simple( MAP *map)
   map->npix=map->nx*map->ny;
   map->map=(actData *)malloc(sizeof(actData)*map->npix);
 
-  mprintf(stdout,"Offsets are %d %d\n",map->projection->rapix,map->projection->decpix);
-  mprintf(stdout,"Pixsizes are %14.6f %14.6f\n",map->projection->radelt,map->projection->decdelt);
+  mprintf(stdout,"Offsets are %12.4f %12.4f\n",map->projection->rapix,map->projection->decpix);
+  mprintf(stdout,"Pixsizes are %14.8f %14.8f\n",map->projection->radelt,map->projection->decdelt);
   mprintf(stdout,"ra/dec0/1 are %14.8f %14.8f %14.8f %14.8f\n",ra0,ra1,dec0,dec1);
   mprintf(stdout,"pv is %14.6f\n",map->projection->pv);
   mprintf(stdout,"map sizes are %d %d\n",map->nx, map->ny);
@@ -264,7 +344,7 @@ void radec2xy_tan_raw(actData *x, actData *y, actData ra, actData dec, actData r
 
 }
 /*--------------------------------------------------------------------------------*/
-void radec2xy_tan(actData *x, actData *y,actData ra, actData dec, nkProjection *proj)
+void radec2xy_tan(actData *x, actData *y,actData ra, actData dec, const nkProjection *proj)
 {
   //printf("hello!\n");
   radec2xy_tan_raw(x,y,ra,dec,proj->ra_cent,proj->dec_cent);
@@ -512,4 +592,157 @@ int set_map_projection_cea_predef( MAP *map,actData radelt, actData decdelt, act
 
   
   return 0;
+}
+/*--------------------------------------------------------------------------------*/
+nkProjection *deres_projection(nkProjection *proj)
+{
+  nkProjection *proj2=(nkProjection *)malloc(sizeof(nkProjection));
+  switch(proj->proj_type) {
+  case(NK_CEA):
+    proj2->proj_type=proj->proj_type;
+    proj2->radelt=proj->radelt*2;
+    proj2->decdelt=proj->decdelt*2;
+    proj2->ra_cent=proj->ra_cent;
+    proj2->dec_cent=proj->dec_cent;
+    proj2->rapix=proj->rapix/2+0.25;
+    proj2->decpix=proj->decpix/2+0.25;
+;
+    proj2->pv=proj->pv;
+    return proj2;
+    break;
+  default:
+    printf("Unsupported type in deres_projection.\n");
+    assert(1==0);
+    break;
+  }
+  return NULL;
+}
+
+/*--------------------------------------------------------------------------------*/
+nkProjection *upres_projection(nkProjection *proj)
+{
+  nkProjection *proj2=(nkProjection *)malloc(sizeof(nkProjection));
+  switch(proj->proj_type) {
+  case(NK_CEA):
+    proj2->proj_type=proj->proj_type;
+    proj2->radelt=proj->radelt/2;
+    proj2->decdelt=proj->decdelt/2;
+    proj2->ra_cent=proj->ra_cent;
+    proj2->dec_cent=proj->dec_cent;
+    proj2->rapix=proj->rapix*2-0.5;
+    proj2->decpix=proj->decpix*2-0.5;
+    proj2->pv=proj->pv;
+    return proj2;
+    break;
+  default:
+    printf("Unsupported type in deres_projection.\n");
+    assert(1==0);
+    break;
+  }
+  return NULL;
+}
+/*--------------------------------------------------------------------------------*/
+MAP *extract_subregion_map_cea(MAP *map, actData ramin, actData ramax, actData decmin, actData decmax, int do_copy)
+{
+  return NULL; //still in progress
+#if 0
+  int xmin,xmax,ymin,ymax;
+  radec2pix_cea(map,ramin,decmin,&xmin,&ymin);
+  radec2pix_cea(map,ramax,decmax,&xmax,&ymax);
+  MAP *small_map=(MAP *)calloc(sizeof(MAP),1);
+  small_map->pixsize=map->pixsize;
+  small_map->nx=(xmax-xmin)+1;
+  small_map->ny=(ymax-ymin)+1;
+  small_map->npix=small_map->nx*small_map->ny;
+  small_map->have_locks=0;
+  small_map->projection=(nkProjection *)calloc(sizeof(nkProjection),1);
+  small_map->projection->radelt=map->projection->radelt;
+  small_map->projection->decdelt=map->projection->decdelt;
+  small_map->projection->rapix=map->projection->rapix+ymin;
+  small_map->projection->decpix=map->projection->decpix+ymin;
+  small_map->projection->pv=map->projection->pv;
+#ifdef ACTPOL
+  small_map->pol_state=map->pol_state;
+  small_map->npix*=get_npol_in_map(map);
+#endif
+  small_map->map=(actData *)malloc(sizeof(actData)*small_map->npix);
+  if (do_copy) {
+    int fac=get_npol_in_map(small_map);
+    for (int i=0;i<small_map->ny;i++) {
+    }
+    
+  }
+#endif
+}
+
+/*--------------------------------------------------------------------------------*/
+void convert_radec_to_map_pixel(const actData *ra, const actData *dec, int *ind, long ndata, const MAP *map)
+{
+  const nkProjection *proj=map->projection;
+  switch(proj->proj_type) {
+  case(NK_RECT): 
+    //printf("Doing rectangular projection.\n");
+    for (long i=0;i<ndata;i++)
+      ind[i]=(int)((dec[i]-map->decmin)/map->pixsize)+map->ny*(int)((ra[i]-map->ramin)/map->pixsize);    
+    break;
+  case(NK_TAN):
+    {
+      actData x,y;
+      for (long i=0;i<ndata;i++) {
+        radec2xy_tan(&x,&y,ra[i],dec[i],proj);
+        ind[i]=(int)(x+0.5)+map->nx*((int)(y+0.5));
+      }
+    }
+    break;
+#ifdef USE_HEALPIX
+  case(NK_HEALPIX_RING):
+    for (int i=0;i<ndata;i++) {
+      //ang2pix_ring(map->projection->nside,PI_OVER_TWO-dec[i],ra[i],&ind[i]);
+      long tmp;
+      ang2pix_ring(map->projection->nside,PI_OVER_TWO-dec[i],ra[i],&tmp);
+      ind[i]=tmp;
+    }
+    break;
+  case(NK_HEALPIX_NEST):
+    for (int i=0;i<ndata;i++) {
+      //ang2pix_nest(map->projection->nside,PI_OVER_TWO-dec[i],ra[i],&ind[i]); 
+      long tmp;
+      ang2pix_nest(map->projection->nside,PI_OVER_TWO-dec[i],ra[i],&tmp); 
+      ind[i]=tmp;
+    }
+    break;
+#endif
+  case (NK_CEA):
+    radecvec2cea_pix(ra,dec, NULL,NULL,ind,ndata,map);
+    break;
+  default:
+    printf("Unknown type in convert_radec_to_map_pixel.\n");
+    assert(1==0);
+    break;
+  }
+  
+}
+
+/*--------------------------------------------------------------------------------*/
+void convert_saved_pointing_to_pixellization(mbTOD *tod, MAP *map)
+//convert the ra/dec saved in a TOD to a map pixellization.  Free the RA/Dec.
+{
+  if ((!tod->ra_saved) ||(!tod->dec_saved)) {
+    fprintf(stderr,"Missing ra/dec in TOD in convert_saved_pointing_to_pixellization.\n");
+    return;
+  }
+  if (!tod->pixelization_saved)
+    tod->pixelization_saved=imatrix(tod->ndet,tod->ndata);
+#pragma omp parallel for shared(tod,map) default(none)
+  for (int i=0;i<tod->ndet;i++)
+    convert_radec_to_map_pixel(tod->ra_saved[i],tod->dec_saved[i],tod->pixelization_saved[i],tod->ndata,map);
+  
+  free(tod->ra_saved[0]);
+  free(tod->ra_saved);
+  tod->ra_saved=NULL;
+
+  free(tod->dec_saved[0]);
+  free(tod->dec_saved);
+  tod->dec_saved=NULL;
+  
 }

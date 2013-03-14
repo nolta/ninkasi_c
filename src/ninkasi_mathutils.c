@@ -1,4 +1,6 @@
+#ifndef MAKEFILE_HAND
 #include "config.h"
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -16,6 +18,11 @@
 
 void dgemm_(char *TRANSA, char *TRANSB, int *M, int *N, int *K, double *ALPHA, double *A, int *LDA, double *B, int *LDB, double  *beta, double *C, int *LDC, int transalen, int transblen );
 void sgemm_(char *TRANSA, char *TRANSB, int *M, int *N, int *K, float *ALPHA, float *A, int *LDA, float *B, int *LDB, float *beta, float *C, int *LDC, int transalen, int transblen );
+
+void dsyrk_(char *uplo, char *trans, int *n, int *k, double *alpha, double *a, int *lda, double *beta, double *c, int *ldc);
+void ssyrk_(char *uplo, char *trans, int *n, int *k, float *alpha, float *a, int *lda, float *beta, float *c, int *ldc);
+
+void act_syrk(char uplo, char trans, int n, int m, actData alpha, actData *a, int lda, actData beta, actData *b, int ldb);
 
 /*--------------------------------------------------------------------------------*/
 
@@ -124,6 +131,44 @@ void add_outer_product(actData *col, int ncol, actData *row, int nrow, actData *
       mat[i][j]+=col[i]*row[j];
 }
 
+/*--------------------------------------------------------------------------------*/
+void linfit_many_vecs(actData **d, actData **vecs, int n, int ncol, int np, actData **fitp)
+//fit a set of vectors *without errors* to many columns of data simultaneously
+{
+  actData **ata=matrix(np,np);
+  actData **atd=matrix(ncol,np);
+
+  //printf("initially, ata/atd are %ld %ld, %ld %ld\n",(long)ata[0],(long)ata,(long)fitp[0],(long)fitp);
+  
+
+  // Make A^T*A
+  act_syrk('u','n',np,n,1.0,vecs[0],np,0.0,ata[0],np);
+  for (int i=0;i<np;i++)
+    for (int j=i+1;j<np;j++)
+      ata[i][j]=ata[j][i];
+
+  //printf("ata block is:\n %16.6e %16.6e %16.6e\n %16.6e %16.6e %16.6e\n %16.6e %16.6e %16.6e\n",ata[0][0],ata[0][1],ata[0][2],ata[1][0],ata[1][1],ata[1][2],ata[2][0],ata[2][1],ata[2][2]);
+
+  // make A^Td 
+  act_gemm('n','n',np,ncol,n,1.0,vecs[0],np,d[0],n,0.0,atd[0],np);
+  //invert A^T A
+  invert_posdef_mat(ata,np);
+  //printf("ata inverse block is:\n %16.6e %16.6e %16.6e\n %16.6e %16.6e %16.6e\n %16.6e %16.6e %16.6e\n",ata[0][0],ata[0][1],ata[0][2],ata[1][0],ata[1][1],ata[1][2],ata[2][0],ata[2][1],ata[2][2]);
+
+  //now multiply for fit params, ata_inv is (np,np) atd is (ncol,np), fitp is (ncol,np)
+
+  //printf("doing final gemm\n");
+  //printf("intermediately, ata/atd are %ld %ld, %ld %ld\n",(long)ata[0],(long)ata,(long)fitp[0],(long)fitp);
+  act_gemm('n','n',np,ncol,np,1.0,ata[0],np,atd[0],np,0.0,fitp[0],np);
+
+  //printf("finally, ata/atd are %ld %ld, %ld %ld\n",(long)ata[0],(long)ata,(long)fitp[0],(long)fitp);
+  //printf("freeing.\n");
+  free(ata[0]);
+  free(ata);
+  free(atd[0]);
+  free(atd);
+  //printf("freed.\n");
+}
 /*--------------------------------------------------------------------------------*/
 actData *linfit(actData *d, double **vecs, actData *errs,  int n, int np)
 //return best-fit parameters of d from vecs, with errors errs.  length of d is n, 
@@ -413,6 +458,31 @@ void act_gemm(char transa, char transb, int m, int n, int k, actData alpha, actD
 #endif
 
 }
+/*--------------------------------------------------------------------------------*/
+#if 0 //defined in ninkasi_noise.c
+void act_syrk(char uplo, char trans, int n, int k, actData alpha, actData *a, int lda, actData beta, actData *c, int ldc)
+{
+#ifdef ACTDATA_DOUBLE
+  dsyrk_(&uplo,&trans,&n,&k,&alpha,a,&lda,&beta,c,&ldc);
+#else
+  ssyrk_(&uplo,&trans,&n,&k,&alpha,a,&lda,&beta,c,&ldc);
+#endif
+}
+#endif
+/*--------------------------------------------------------------------------------*/
+actData act_dot(int n, actData *x, int incx, actData *y, int incy)
+{
+  actData tot=0.0;
+  if (incx==incy==1) {
+    for (int i=0;i<n;i++)
+      tot+=x[i]*y[i];
+  }
+  else {
+    for (int i=0;i<n;i++) 
+      tot+=x[i*incx]*y[i*incy];
+  }
+  return tot;
+}
 
 /*--------------------------------------------------------------------------------*/
 
@@ -553,5 +623,108 @@ actData mygasdev(unsigned *seed)
   
 }
 
+/*--------------------------------------------------------------------------------*/
+static inline actData legendre_x(int i, int ndata)
+//calculate a [-1,1] value for i given ndata
+{
+  actData dx=i;
+  dx/=(ndata-1);
+  return 2*dx-1;
+}
+/*--------------------------------------------------------------------------------*/
+actData **legendre_mat(int ndata, int ord)
+{
+  actData **vecs=matrix(ord,ndata);
+  for (int i=0;i<ndata;i++) {
+    actData x=legendre_x(i,ndata);
+    vecs[0][i]=1;
+    if (ord>1)
+      vecs[1][i]=x;
+    for (int j=1;j<ord-1;j++)
+      vecs[j+1][i]=((2*j+1)*x*vecs[j][i]-j*vecs[j-1][i])/(1+(actData)j);
+  }
+  return vecs;
+}
+/*--------------------------------------------------------------------------------*/
+actData *legendre_fit(actData *data, int ndata, int ord)
+{
+#if 1
+  actData **vecs=legendre_mat(ndata,ord);
+#else
+  actData **vecs=matrix(ord,ndata);
+  for (int i=0;i<ndata;i++) {
+    actData x=legendre_x(i,ndata);
+    vecs[0][i]=1;
+    if (ord>1)
+      vecs[1][i]=x;
+    for (int j=1;j<ord-1;j++)
+      vecs[j+1][i]=((2*j+1)*x*vecs[j][i]-j*vecs[j-1][i])/(1+(actData)j);
+  }
+#endif
+  actData *fitp=linfit(data,vecs,NULL,ndata,ord);
+  free(vecs[0]);
+  free(vecs);
+  return fitp;
+}
+/*--------------------------------------------------------------------------------*/
+void legendre_eval(actData *data, int ndata, actData *fitp, int ord)
+{
+  if (ord<=1) {
+    for (int i=0;i<ndata;i++)
+      data[i]=fitp[0];
+    return;
+  }
+  if (ord==2) {
+    for (int i=0;i<ndata;i++)
+      data[i]=fitp[0]+fitp[1]*legendre_x(i,ndata);
+    return;
+  }
+  for (int i=0;i<ndata;i++) {
+    actData tot=fitp[0];
+    actData x=legendre_x(i,ndata);
+    actData pold=1;
+    actData pcur=x;
+    actData pnext;
+    data[i]=fitp[0]+fitp[1]*x;
+    for (int j=1;j<ord-1;j++) {
+      pnext=((2*j+1)*x*pcur-j*pold)/((actData)j+1);
+      data[i]+=pnext*fitp[j+1];
+      pold=pcur;
+      pcur=pnext;
+    }
+  }
+  return;
+}
+/*--------------------------------------------------------------------------------*/
+void legendre_project(actData *data, int ndata, actData *fitp, int ord)
+{
+  if (ord<=1) {
+    for (int i=0;i<ndata;i++)
+      fitp[0]+=data[i];
+    return;
+  }
+  if (ord==2) {
+    for (int i=0;i<ndata;i++) {
+      fitp[0]+=data[i];
+      fitp[1]+=data[i]*legendre_x(i,ndata);
+    }
+    return;
+  }
+  for (int i=0;i<ndata;i++) {
+    actData tot=fitp[0];
+    actData x=legendre_x(i,ndata);
+    actData pold=1;
+    actData pcur=x;
+    actData pnext;
+    fitp[0]+=data[i];
+    fitp[1]+=data[i]*legendre_x(i,ndata);
 
-
+    for (int j=1;j<ord-1;j++) {
+      pnext=((2*j+1)*x*pcur-j*pold)/((actData)j+1);
+      fitp[j+1]+=data[i]*pnext;
+      pold=pcur;
+      pcur=pnext;
+    }
+  }
+  return;
+}

@@ -69,7 +69,7 @@ int mbCutsRead(mbCuts *c, const char *filename)
 
   FILE *f;
   int nrow, ncol;
-  int MAX_LINE = 20000; // global cut could be v. long with turnaround cuts
+  int MAX_LINE = 200000; // global cut could be v. long with turnaround cuts
   char line[MAX_LINE];
   int first, last;
   int nread = 0;
@@ -82,10 +82,11 @@ int mbCutsRead(mbCuts *c, const char *filename)
 
   fgets( line, MAX_LINE, f );
   sscanf( line, "%d %d\n", &nrow, &ncol );
+  //printf("nread and ncol are %d %d\n",nrow,ncol);
   nread++;
   if ( c->nrow != nrow || c->ncol != ncol ){
     //psTrace("moby", 2, "nrow and ncol in %s does not fit cuts object", filename);
-    fprintf(stderr,"nrow and ncol in %s does not fit cuts object", filename);
+    fprintf(stderr,"nrow and ncol in %s does not fit cuts object\n", filename);
     return nread;
   }
 
@@ -114,10 +115,10 @@ int mbCutsRead(mbCuts *c, const char *filename)
     char *tok = NULL;
     int nnread = 0;
     int row, col;
-
+    printf("starting per-detector cuts.\n");
     while( fgets( line, MAX_LINE, f ) != NULL ) {
       nnread = sscanf( line, "r%dc%d: ", &row, &col );
-      //printf("parsing %d %d\n",row,col);
+      //printf("parsing %d %d %s\n",row,col,line);
       if (nnread != 2) {
         psTrace( "moby", 3, "Bad cutfile format : %s :\n%s\n",
                  filename, line );
@@ -126,7 +127,7 @@ int mbCutsRead(mbCuts *c, const char *filename)
       tok = strtok( line, " " );
       tok = strtok( NULL, " " ); //skip the row/col designator
       if ( tok == NULL ) continue;
-      while ( *tok != '\n' ){
+      while ((tok!=NULL)&&( *tok != '\n' )){
         nnread = sscanf( tok, "(%d,%d)", &first, &last );
         if (nnread != 2) {
           psTrace( "moby", 3, "Bad format in global cuts: %s :\n%s\n",
@@ -139,8 +140,8 @@ int mbCutsRead(mbCuts *c, const char *filename)
       }
     }
   }
-
   fclose(f);
+  printf("finished cuts read.\n");
   return nread;
 }
 /*--------------------------------------------------------------------------------*/

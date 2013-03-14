@@ -1,4 +1,6 @@
+#ifndef MAKEFILE_HAND
 #include "config.h"
+#endif
 
 #include <assert.h>
 #include <math.h>
@@ -7,7 +9,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#ifndef NO_FFTW
 #include <fftw3.h>
+#endif
 
 #include <getopt.h>
 #include <omp.h>
@@ -25,6 +29,7 @@
 #endif
 
 #include "dirfile.h"
+#include "readtod.h"
 #include "astro.h"
 #include "mbCommon.h"
 #include "mbCuts.h"
@@ -130,7 +135,7 @@ void *malloc_retry(size_t n)
     void *vec=malloc(n);
     if (vec)
       return vec;
-    fprintf(stderr,"Malloc failure when asking for %d bytes..  Retrying %d...\n",n,i);
+    fprintf(stderr,"Malloc failure when asking for %ld bytes..  Retrying %d...\n",n,i);
     pca_pause(pause_len);
   }
   return NULL;
@@ -436,13 +441,14 @@ actData *read_1d_datafile(char *fname, int *n)
   if (!infile)
     return NULL;
   int n_check;
-  fread(&n_check,1,sizeof(int),infile);
+  size_t crap; //just pulling the values of fread so we don't get warnings.
+  crap=fread(&n_check,1,sizeof(int),infile);
   if (*n!=0) 
     assert(*n==n_check);
   else
     *n=n_check;
   actData *vec=vector(*n);
-  fread(vec,*n,sizeof(actData),infile);
+  crap=fread(vec,*n,sizeof(actData),infile);
   fclose(infile);
   return vec;
 }
@@ -456,17 +462,38 @@ double *read_1d_datafile_double(char *fname, int *n)
   if (!infile)
     return NULL;
   int n_check;
-  fread(&n_check,1,sizeof(int),infile);
+  size_t crap;  //pull return value of fread just to avoid a warning
+  crap=fread(&n_check,1,sizeof(int),infile);
   if (*n!=0) 
     assert(*n==n_check);
   else
     *n=n_check;
   double *vec=(double *)malloc_retry(sizeof(double)*(*n));
-  fread(vec,*n,sizeof(double),infile);
+  crap=fread(vec,*n,sizeof(double),infile);
   fclose(infile);
   return vec;
 }
+/*--------------------------------------------------------------------------------*/
 
+void purge_vector(mbTOD *tod, actData *vec, int ngood)
+{
+  //printf("shrinking from %d to %d\n",tod->ndet,ngood);
+  actData *tmp=vector(ngood);
+  int icur=0;
+  for (int i=0;i<tod->ndet;i++) {
+    if (!mbCutsIsAlwaysCut(tod->cuts,tod->rows[i],tod->cols[i])) {
+      tmp[icur]=vec[i];
+      icur++;
+    }
+  }
+  actData *crud=(actData *)realloc(vec,sizeof(actData)*ngood);
+  assert(crud==vec);
+  memcpy(vec,tmp,sizeof(actData)*ngood);
+  free(tmp);
+  
+  //free(vec);
+  //*vec_in=tmp;
+}
 /*--------------------------------------------------------------------------------*/
 void purge_cut_detectors(mbTOD *tod)
 {
@@ -474,6 +501,18 @@ void purge_cut_detectors(mbTOD *tod)
   for (int i=0;i<tod->ndet;i++)
     if (!mbCutsIsAlwaysCut(tod->cuts,tod->rows[i],tod->cols[i]))
       ngood++;
+
+#ifdef ACTPOL
+  if (tod->actpol_pointing) {
+    ACTpolPointingFit *fit=tod->actpol_pointing;
+    if (fit->dx) 
+      purge_vector(tod,(tod->actpol_pointing->dx),ngood);
+    if (fit->dy)
+      purge_vector(tod,(tod->actpol_pointing->dy),ngood);
+    if (fit->theta)
+      purge_vector(tod,(tod->actpol_pointing->theta),ngood);
+  }
+#endif
 
   int *rows=(int *)malloc_retry(sizeof(int)*ngood);
   int *cols=(int *)malloc_retry(sizeof(int)*ngood);
@@ -506,6 +545,16 @@ void purge_cut_detectors(mbTOD *tod)
 /*--------------------------------------------------------------------------------*/
 int get_numel_cut(mbTOD *tod) //return how many elements have been cut in a TOD
 {
+  if (tod->cuts_fit_params) {
+    int dd=tod->ndet-1;
+    while (tod->cuts_fit_params[tod->rows[dd]][tod->cols[dd]]->nregions==0) {
+      dd--;
+      if (dd<0)
+	assert(1==0);
+    }
+    mbCutFitParams *params=tod->cuts_fit_params[tod->rows[dd]][tod->cols[dd]];
+    return params->starting_param[params->nregions-1]+params->nparams[params->nregions-1];
+  }
   if (tod->cuts_as_vec) {
     int det=tod->ndet-1;
     while (1) {
@@ -525,6 +574,117 @@ int get_numel_cut(mbTOD *tod) //return how many elements have been cut in a TOD
     
 }
 
+/*--------------------------------------------------------------------------------*/
+void setup_cutsfits_precon(mbTOD *tod)
+{
+  assert(tod);
+  assert(tod->cuts_fit_params);
+  actData *winvec=(actData *)malloc(sizeof(actData)*tod->ndata);
+  for (int i=0;i<tod->ndata;i++)
+    winvec[i]=1.0;
+  int nsamp=tod->n_to_window;
+  
+  //#define CUTFITS_DEBUG
+
+#if 0
+  if (nsamp>0) {
+    for (int i=0;i<nsamp;i++) {
+      winvec[i]=0.5-0.5*cos(M_PI*i/(nsamp+0.0));
+      winvec[i]=winvec[i]*winvec[i];
+      //window2[i]=0.5+0.5*cos(M_PI*i/(nsamp+0.0));
+      winvec[tod->ndata-i-1]=winvec[i];
+    }    
+  }
+#endif
+
+#pragma omp parallel for shared(tod,winvec,nsamp) default(none)
+  for (int det=0;det<tod->ndet;det++) {
+    mbCutFitParams *params=tod->cuts_fit_params[tod->rows[det]][tod->cols[det]];
+    mbUncut *cut=tod->cuts_as_uncuts[tod->rows[det]][tod->cols[det]];
+    params->precon=(actData ***)malloc(sizeof(actData **)*params->nregions);
+    for (int i=0;i<params->nregions;i++) {
+      int nelem=cut->indexLast[i]-cut->indexFirst[i];
+      actData **mat=legendre_mat(nelem,params->nparams[i]);
+#ifdef CUTFITS_DEBUG
+      for (int ii=0;ii<params->nparams[i];ii++)
+	for (int jj=0;jj<nelem;jj++) 
+	  if (!isfinite(mat[ii][jj])) {
+	    printf("Have a not-finite element on matrix element %d %d, segment  %d on detector %d %d with length %d\n",ii,jj,i,tod->rows[det],tod->cols[det],nelem);
+	    return;
+	  }
+#endif
+
+#ifdef CUTFITS_DEBUG
+      if (i==2) {
+	FILE *outfile=fopen("mat_temp.txt","w");
+	for (int ii=0;ii<nelem;ii++) {
+	  for (int jj=0;jj<params->nparams[i];jj++)
+	    fprintf(outfile,"%13.5e ",mat[jj][ii]);
+	  fprintf(outfile,"  %13.5e\n",winvec[ii+cut->indexFirst[i]]);
+	}
+	fclose(outfile);
+	return;
+      }
+#endif
+
+      actData **precon=matrix(params->nparams[i],params->nparams[i]);
+      for (int ii=0;ii<params->nparams[i];ii++)
+	for (int jj=ii;jj<params->nparams[i];jj++) {
+	  precon[ii][jj]=0;
+	  for (int kk=0;kk<nelem;kk++)
+	    precon[ii][jj]+=mat[ii][kk]*mat[jj][kk]*winvec[kk+cut->indexFirst[i]];
+	  precon[jj][ii]=precon[ii][jj];
+	}
+      
+#ifdef CUTFITS_DEBUG
+      for (int ii=0;ii<params->nparams[i];ii++)
+	for (int jj=0;jj<params->nparams[i];jj++) 
+	  if (!isfinite(precon[ii][jj])) {
+	    printf("Have a not-finite precon element on matrix element %d %d, segment  %d on detector %d %d with length %d\n",ii,jj,i,tod->rows[det],tod->cols[det],nelem);
+	    return;
+	  }
+
+      for (int ii=0;ii<params->nparams[i];ii++) {
+	for (int jj=0;jj<params->nparams[i];jj++)
+	  printf("%13.5e ",precon[ii][jj]);
+	printf("\n");
+      }
+#endif
+      int info=invert_posdef_mat(precon,params->nparams[i]);
+      if (info) {
+	printf("error inverting segment %d on detector %d %d %d\n",i,det,tod->rows[det],tod->cols[det]);
+	//return;
+      }
+      for (int ii=0;ii<params->nparams[i];ii++)
+	for (int jj=0;jj<params->nparams[i];jj++) 
+	  if (!isfinite(precon[ii][jj])) {
+	    printf("Have a not-finite element on segment %d on detector %d %d with length %d\n",i,tod->rows[det],tod->cols[det],nelem);
+	    //return;
+	  }
+      params->precon[i]=precon;
+      free(mat[0]);
+      free(mat);
+    }
+  }
+  free(winvec);
+}
+/*--------------------------------------------------------------------------------*/
+void apply_cutfits_precon(mbTOD *tod, actData *params_in, actData *params_out)
+{
+  assert(tod);
+  assert(tod->cuts_fit_params);
+
+#pragma omp parallel for shared(tod,params_in,params_out) default(none) 
+  for (int det=0;det<tod->ndet;det++) {
+    mbCutFitParams *params=tod->cuts_fit_params[tod->rows[det]][tod->cols[det]];
+    for (int i=0;i<params->nregions;i++) {
+      for (int ii=0;ii<params->nparams[i];ii++) 
+	for (int jj=0;jj<params->nparams[i];jj++) 
+	  params_out[params->starting_param[i]+jj]+=params_in[params->starting_param[i]+jj]*params->precon[i][ii][jj];
+    }
+  }
+  
+}
 /*--------------------------------------------------------------------------------*/
 mbUncut ***get_cut_regions_global_index(mbTOD *tod) 
 //make the globally referenced cuts indices, for a 1-d array for gapfilling.
@@ -639,6 +799,121 @@ mbUncut ***get_cut_regions(mbTOD *tod)
   return mat;
 }
 /*--------------------------------------------------------------------------------*/
+mbCutFitParams ***setup_cut_fit_params(mbTOD *tod, int *nparams_from_length)
+//nparams_from_length contains the mapping from cut length to # of polynomial parameters
+{
+  assert(tod);
+  assert(tod->cuts_as_uncuts);
+
+  mbCutFitParams **vec=(mbCutFitParams **)malloc_retry(sizeof(mbCutFitParams *)*tod->nrow*tod->ncol);
+  mbCutFitParams ***mat=(mbCutFitParams ***)malloc_retry(sizeof(mbCutFitParams **)*tod->nrow);
+  memset(vec,0,sizeof(mbCutFitParams **)*tod->nrow*tod->ncol);
+
+  for (int i=0;i<tod->nrow;i++)
+    mat[i]=vec+i*tod->ncol;
+
+  int global_accum=0;
+#if 0
+  for (int i=0;i<tod->nrow;i++)
+    for (int j=0;j<tod->ncol;j++) {
+      //printf("working on detector %d %d\n",i,j);                                                                                                                                           
+      if (tod->cuts_as_uncuts[i][j]==NULL)
+        printf("cuts_as_uncuts is null.\n");
+      mat[i][j]=(mbCutFitParams *)malloc_retry(sizeof(mbCutFitParams));
+      mat[i][j]->nregions=tod->cuts_as_uncuts[i][j]->nregions;
+      mat[i][j]->starting_param=(int *)malloc(mat[i][j]->nregions*sizeof(int));
+      mat[i][j]->nparams=(int *)malloc(mat[i][j]->nregions*sizeof(int));
+      for (int k=0;k<tod->cuts_as_uncuts[i][j]->nregions;k++) {
+	mat[i][j]->nparams[k]=nparams_from_length[tod->cuts_as_uncuts[i][j]->indexLast[k]-tod->cuts_as_uncuts[i][j]->indexFirst[k]];
+	mat[i][j]->starting_param[k]=global_accum;
+	global_accum+=mat[i][j]->nparams[k];
+      }
+    }
+#else
+  for (int det=0;det<tod->ndet;det++) {
+    int i=tod->rows[det];
+    int j=tod->cols[det];
+    //printf("working on %4d %2d %2d with accum %8d\n",det,i,j,global_accum);
+    if (tod->cuts_as_uncuts[i][j]==NULL)
+      printf("cuts_as_uncuts is null.\n");
+    mat[i][j]=(mbCutFitParams *)malloc_retry(sizeof(mbCutFitParams));
+    mat[i][j]->nregions=tod->cuts_as_uncuts[i][j]->nregions;
+    mat[i][j]->starting_param=(int *)malloc(mat[i][j]->nregions*sizeof(int));
+    mat[i][j]->nparams=(int *)malloc(mat[i][j]->nregions*sizeof(int));
+    for (int k=0;k<tod->cuts_as_uncuts[i][j]->nregions;k++) {
+      int cutlen=tod->cuts_as_uncuts[i][j]->indexLast[k]-tod->cuts_as_uncuts[i][j]->indexFirst[k];
+      //printf("cutlen is %5d, nparams is %d\n",cutlen,nparams_from_length[cutlen]);
+      mat[i][j]->nparams[k]=nparams_from_length[tod->cuts_as_uncuts[i][j]->indexLast[k]-tod->cuts_as_uncuts[i][j]->indexFirst[k]];
+      mat[i][j]->starting_param[k]=global_accum;
+      global_accum+=mat[i][j]->nparams[k];
+    }
+  }
+  
+#endif
+  return mat;
+  
+}
+/*--------------------------------------------------------------------------------*/
+int cutpolys2tod(mbTOD *tod,actData *cutvec)
+{
+  if (!tod->have_data) {
+    fprintf(stderr,"missing data in tod in cutvec2tod\n");
+    return 1;
+  }
+  if (tod->cuts_as_vec==NULL) {
+    fprintf(stderr,"Error, tod does not contain cuts_as_vec in cutpolys2tod.\n");
+    return 1;
+  }
+  if (tod->cuts_as_uncuts==NULL) {
+    fprintf(stderr,"Error, tod does not contain cuts_as_uncut in cutpolys2tod.\n");
+    return 1;    
+  }
+  if (tod->cuts_fit_params==NULL) {
+    fprintf(stderr,"Error - tod does not contain cut fit parameters in cutpolys2tod.\n");
+    return 1;
+  }
+#pragma omp parallel for shared(tod,cutvec) default(none)
+  for (int det=0;det<tod->ndet;det++) {
+    mbCutFitParams *params=tod->cuts_fit_params[tod->rows[det]][tod->cols[det]];
+    mbUncut *cut=tod->cuts_as_uncuts[tod->rows[det]][tod->cols[det]];
+    for (int i=0;i<params->nregions;i++) {
+      legendre_eval(tod->data[det]+cut->indexFirst[i],cut->indexLast[i]-cut->indexFirst[i],cutvec+params->starting_param[i],params->nparams[i]);
+    }
+  }
+  
+  return 0;
+}
+/*--------------------------------------------------------------------------------*/
+int tod2cutpolys(mbTOD *tod,actData *cutvec)
+{
+  if (!tod->have_data) {
+    fprintf(stderr,"missing data in tod in cutvec2tod\n");
+    return 1;
+  }
+  if (tod->cuts_as_vec==NULL) {
+    fprintf(stderr,"Error, tod does not contain cuts_as_vec in cutpolys2tod.\n");
+    return 1;
+  }
+  if (tod->cuts_as_uncuts==NULL) {
+    fprintf(stderr,"Error, tod does not contain cuts_as_uncut in cutpolys2tod.\n");
+    return 1;    
+  }
+  if (tod->cuts_fit_params==NULL) {
+    fprintf(stderr,"Error - tod does not contain cut fit parameters in cutpolys2tod.\n");
+    return 1;
+  }
+#pragma omp parallel for shared(tod,cutvec) default(none)
+  for (int det=0;det<tod->ndet;det++) {
+    mbCutFitParams *params=tod->cuts_fit_params[tod->rows[det]][tod->cols[det]];
+    mbUncut *cut=tod->cuts_as_uncuts[tod->rows[det]][tod->cols[det]];
+    for (int i=0;i<params->nregions;i++) {
+      legendre_project(tod->data[det]+cut->indexFirst[i],cut->indexLast[i]-cut->indexFirst[i],cutvec+params->starting_param[i],params->nparams[i]);
+    }
+  }
+  
+  return 0;
+}
+/*--------------------------------------------------------------------------------*/
 mbUncut ***get_uncut_regions(mbTOD *tod) 
 //calculate the uncut regions and return a matrix to 'em.
 {
@@ -746,7 +1021,10 @@ void fill_gaps_stupid(mbTOD *tod)
   }
 #pragma omp parallel for shared(tod) default(none)
   for (int det=0;det<tod->ndet;det++) {
-    mbUncut *uncut=tod->uncuts[tod->rows[det]][tod->cols[det]];
+    mbUncut *uncut;
+    uncut=tod->uncuts[tod->rows[det]][tod->cols[det]];
+    if (tod->uncuts_for_interp)
+      uncut=tod->uncuts_for_interp[tod->rows[det]][tod->cols[det]];
     int nreg=uncut->nregions;
     if (nreg>0) {
       if (uncut->indexFirst[0]>0)
@@ -1012,17 +1290,82 @@ MAP *make_blank_map_copy(const MAP *map)
   map_copy->ny=map->ny;
   map_copy->npix=map->npix;
   map_copy->have_locks=0;  //don't recycle locks.  will create them as needed, if needed.
-  map_copy->map=(actData *)malloc_retry(sizeof(actData)*map_copy->npix);
+#ifdef ACTPOL
+  memcpy(map_copy->pol_state,map->pol_state,MAX_NPOL*sizeof(map->pol_state[0]));
+#endif
+  map_copy->map=(actData *)malloc_retry(sizeof(actData)*map_copy->npix*get_npol_in_map(map));
   //memcpy(map_copy->map,map->map,sizeof(actData)*map_copy->npix);
   clear_map(map_copy);
   return map_copy;
+}
+
+/*--------------------------------------------------------------------------------*/
+MAP *deres_map(MAP *map)
+{
+  MAP *map_copy;
+  map_copy=(MAP *)malloc_retry(sizeof(MAP));
+  
+  assert(map->projection->proj_type!=NK_HEALPIX_RING);  //if healpix, have to handle things a bit differently
+  assert(map->projection->proj_type!=NK_HEALPIX_NEST);
+  map_copy->pixsize=map->pixsize*2;
+  map_copy->ramin=map->ramin;
+  map_copy->ramax=map->ramax;
+  map_copy->decmin=map->decmin;
+  map_copy->decmax=map->decmax;
+  map_copy->nx=map->nx/2;
+  map_copy->ny=map->ny/2;
+  map_copy->npix=map_copy->nx*map_copy->ny;
+  //map_copy->projection=(nkProjection *)malloc_retry(sizeof(nkProjection));
+  //memcpy(map_copy->projection,map->projection,sizeof(nkProjection));
+  map_copy->projection=deres_projection(map->projection);
+  map_copy->have_locks=0;  //don't recycle locks.  will create them as needed, if needed.
+  map_copy->map=(actData *)malloc_retry(sizeof(actData)*map_copy->npix);
+  //memcpy(map_copy->map,map->map,sizeof(actData)*map_copy->npix);
+  
+  memset(map_copy->map,0,sizeof(actData)*map_copy->npix);
+  for (int i=0;i<map_copy->ny*2;i++) 
+    for (int j=0;j<map_copy->nx*2;j++)
+      map_copy->map[(i/2)*map_copy->nx+(j/2)]+=map->map[i*map->nx+j];
+  
+  return map_copy;
+  
+}
+/*--------------------------------------------------------------------------------*/
+MAP *upres_map(MAP *map)
+{
+  MAP *map_copy;
+  map_copy=(MAP *)malloc_retry(sizeof(MAP));
+  
+  assert(map->projection->proj_type!=NK_HEALPIX_RING);  //if healpix, have to handle things a bit differently
+  assert(map->projection->proj_type!=NK_HEALPIX_NEST);
+  map_copy->pixsize=map->pixsize/2;
+  map_copy->ramin=map->ramin;
+  map_copy->ramax=map->ramax;
+  map_copy->decmin=map->decmin;
+  map_copy->decmax=map->decmax;
+  map_copy->nx=map->nx*2;
+  map_copy->ny=map->ny*2;
+  map_copy->npix=map_copy->nx*map_copy->ny;
+  //map_copy->projection=(nkProjection *)malloc_retry(sizeof(nkProjection));
+  //memcpy(map_copy->projection,map->projection,sizeof(nkProjection));
+  map_copy->projection=upres_projection(map->projection);
+  map_copy->have_locks=0;  //don't recycle locks.  will create them as needed, if needed.
+  map_copy->map=(actData *)malloc_retry(sizeof(actData)*map_copy->npix);
+  //memcpy(map_copy->map,map->map,sizeof(actData)*map_copy->npix);
+  for (int i=0;i<map_copy->ny;i++) 
+    for (int j=0;j<map_copy->nx;j++)
+      map_copy->map[i*map_copy->nx+j]=map->map[(i/2)*map->nx+(j/2)];
+  
+  return map_copy;
+  
 }
 /*--------------------------------------------------------------------------------*/
 
 MAP *make_map_copy(MAP *map)
 {
   MAP *map_copy;
-  map_copy=(MAP *)malloc_retry(sizeof(MAP));
+  //map_copy=(MAP *)malloc_retry(sizeof(MAP));
+  map_copy=(MAP *)calloc(sizeof(MAP),1);
 
   map_copy->pixsize=map->pixsize;
   map_copy->ramin=map->ramin;
@@ -1035,8 +1378,11 @@ MAP *make_map_copy(MAP *map)
   map_copy->projection=(nkProjection *)malloc_retry(sizeof(nkProjection));
   memcpy(map_copy->projection,map->projection,sizeof(nkProjection));
   map_copy->have_locks=0;  //don't recycle locks.  will create them as needed, if needed.
-  map_copy->map=(actData *)malloc_retry(sizeof(actData)*map_copy->npix);
-  memcpy(map_copy->map,map->map,sizeof(actData)*map_copy->npix);
+  map_copy->map=(actData *)malloc_retry(sizeof(actData)*map_copy->npix*get_npol_in_map(map));
+#ifdef ACTPOL
+  memcpy(map_copy->pol_state,map->pol_state,MAX_NPOL*sizeof(map->pol_state[0]));
+#endif
+  memcpy(map_copy->map,map->map,sizeof(actData)*map_copy->npix*get_npol_in_map(map));
   return map_copy;
 }
 /*--------------------------------------------------------------------------------*/
@@ -1072,7 +1418,7 @@ MAPvec *make_mapset_copy(MAPvec *maps)
 /*--------------------------------------------------------------------------------*/
 void clear_map(MAP *map)
 {
-  memset(map->map,0,sizeof(actData)*map->npix);
+  memset(map->map,0,sizeof(actData)*map->npix*get_npol_in_map(map));
 }
 /*--------------------------------------------------------------------------------*/
 void clear_mapset(MAPvec *maps)
@@ -1476,6 +1822,146 @@ actData  *how_far_am_i_from_radec_radians_vec( actData *ra, actData *dec, int np
   
   return dists;
 }
+
+
+/*--------------------------------------------------------------------------------*/
+void generate_index_mapping(MAP *map, mbTOD *tod, int **inds)
+{
+  assert(map);
+  assert(map->projection);
+#pragma omp parallel shared(map,tod,inds)
+  {
+    PointingFitScratch *scratch=allocate_pointing_fit_scratch(tod);
+#pragma omp for schedule(dynamic,4)
+    for (int i=0;i<tod->ndet;i++) 
+      if ((!mbCutsIsAlwaysCut(tod->cuts,tod->rows[i],tod->cols[i]))&&(is_det_listed(tod,NULL,i)))
+	get_pointing_vec_new(tod,map,i,inds[i],scratch);  
+    destroy_pointing_fit_scratch(scratch);   
+   }
+}
+/*--------------------------------------------------------------------------------*/
+void find_map_index_limits(MAP *map, mbTOD *tod, int *imin_out, int *imax_out)
+{
+  int imin=map->npix+2;
+  int imax=-1;
+#pragma omp parallel shared(map,tod,imin,imax) default(none)
+  {
+    int myimin=imin;
+    int myimax=imax;
+
+    PointingFitScratch *scratch=allocate_pointing_fit_scratch(tod);
+    int *itmp=(int *)malloc(sizeof(int)*tod->ndata);
+#pragma omp for schedule(dynamic,4)
+    for (int i=0;i<tod->ndet;i++) 
+      if ((!mbCutsIsAlwaysCut(tod->cuts,tod->rows[i],tod->cols[i]))&&(is_det_listed(tod,NULL,i))) {
+        get_pointing_vec_new(tod,map,i,itmp,scratch);
+	if (tod->kept_data) {
+	  int row=tod->rows[i];
+	  int col=tod->cols[i];
+	  mbUncut *uncut=tod->kept_data[row][col];
+	  for (int region=0;region<uncut->nregions;region++)
+	    for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++) {
+	      if (itmp[j]>myimax)
+		myimax=itmp[j];
+	      if (itmp[j]<myimin)
+		myimin=itmp[j];
+	    }
+	  
+	}
+	else {
+	  if (tod->uncuts) {
+	    int row=tod->rows[i];
+	    int col=tod->cols[i];
+	    mbUncut *uncut=tod->uncuts[row][col];
+	    for (int region=0;region<uncut->nregions;region++)
+	      for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++) {
+		if (itmp[j]>myimax)
+		  myimax=itmp[j];
+		if (itmp[j]<myimin)
+		  myimin=itmp[j];
+	      }
+	  }
+	}
+
+      }
+#pragma omp critical
+    {
+      if (myimin<imin)
+	imin=myimin;
+      if (myimax>imax)
+	imax=myimax;
+    }
+    destroy_pointing_fit_scratch(scratch);
+    free(itmp);
+  }
+  *imin_out=imin;
+  *imax_out=imax;
+  
+}
+/*--------------------------------------------------------------------------------*/
+int *tod2map_actpol(MAP *map, mbTOD *tod, int *ipiv_proc)
+//project a tod into a map, hopefully with better ompness.  It wants to know the
+//index limits for processes when mapping TODs into a map.  If ipiv_proc comes in as null,
+//it will calculate some for you.
+{
+
+  //float **sin2gamma=fmatrix(tod->ndet,tod->ndata);  //eventually polarization goes in.
+  assert(map);
+  assert(map->projection);
+  if (ipiv_proc==NULL) {
+    printf("Nope, pivot finding not yet implemented.\n");
+    return NULL;    
+  }
+    
+  int **inds=imatrix(tod->ndet,tod->ndata);
+  generate_index_mapping(map,tod, inds);
+  
+
+  
+#pragma omp parallel shared(map,tod,inds,ipiv_proc) default(none)
+  {
+    int myid=omp_get_thread_num();
+    
+#pragma omp for
+    for (int i=0;i<tod->ndet;i++) {
+      if ((!mbCutsIsAlwaysCut(tod->cuts,tod->rows[i],tod->cols[i]))&&(is_det_listed(tod,NULL,i))) {      
+	if (tod->kept_data) {
+	  int row=tod->rows[i];
+	  int col=tod->cols[i];
+	  mbUncut *uncut=tod->kept_data[row][col];
+	  for (int region=0;region<uncut->nregions;region++)
+	    for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++) {
+	      int itmp=inds[i][j];
+	      if ((itmp>=ipiv_proc[myid])&&(itmp<ipiv_proc[myid+1]))
+		map->map[itmp]+=tod->data[i][j];
+	    }
+	}
+	else {
+	  if (tod->uncuts) {
+	    int row=tod->rows[i];
+	    int col=tod->cols[i];
+	    mbUncut *uncut=tod->uncuts[row][col];
+	    for (int region=0;region<uncut->nregions;region++)
+	      for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++) {
+		int itmp=inds[i][j];
+		if ((itmp>=ipiv_proc[myid])&&(itmp<ipiv_proc[myid+1]))
+		  map->map[itmp]+=tod->data[i][j];
+	      }
+	  }
+	  else
+	    for (int j=0;j<tod->ndata;j++)
+	      map->map[inds[i][j]]+=tod->data[i][j];
+	}
+      }
+    }
+  }
+  free(inds[0]);
+  free(inds);
+
+  return NULL;
+
+}
+
 /*--------------------------------------------------------------------------------*/
 void tod2map_nocopy(MAP *map, mbTOD *tod,PARAMS *params)
 {
@@ -1483,18 +1969,18 @@ void tod2map_nocopy(MAP *map, mbTOD *tod,PARAMS *params)
 
   assert(map);
   assert(map->projection);
-
 #pragma omp parallel shared(map,tod,inds)
   {
     PointingFitScratch *scratch=allocate_pointing_fit_scratch(tod);
 #pragma omp for schedule(dynamic,4)
-    for (int i=0;i<tod->ndet;i++) 
+    for (int i=0;i<tod->ndet;i++) { 
       if ((!mbCutsIsAlwaysCut(tod->cuts,tod->rows[i],tod->cols[i]))&&(is_det_listed(tod,params,i)))
 	get_pointing_vec_new(tod,map,i,inds[i],scratch);  
+    }
     destroy_pointing_fit_scratch(scratch);
     
    }
-  
+
   for (int i=0;i<tod->ndet;i++) {
     if ((!mbCutsIsAlwaysCut(tod->cuts,tod->rows[i],tod->cols[i]))&&(is_det_listed(tod,params,i))) {
       
@@ -1528,6 +2014,20 @@ void tod2map_nocopy(MAP *map, mbTOD *tod,PARAMS *params)
       
 }
 /*--------------------------------------------------------------------------------*/
+int is_map_polarized(MAP *map) 
+{
+#ifdef ACTPOL
+  //return (map->pol_state>1);
+  //If anything past the first polarization slot is populated, we're polarized
+  for (int i=1;i<MAX_NPOL;i++)
+    if (map->pol_state[i])
+      return 1;
+  return 0;
+#else
+  return 0;
+#endif
+}
+/*--------------------------------------------------------------------------------*/
 void tod2map(MAP *map, mbTOD *tod, PARAMS *params)
 {
 
@@ -1535,19 +2035,26 @@ void tod2map(MAP *map, mbTOD *tod, PARAMS *params)
   assert(map);
   assert(map->projection);
 
+#ifdef ACTPOLFWEEE
+  if (is_map_polarized(map)) {       
+    return;
+  }
+#endif
+
 
   int nproc;
+  //printf("projecting TOD into map.\n");
 #pragma omp parallel shared(nproc) default(none)
 #pragma omp single
   nproc=omp_get_num_threads();
-
+  
   if (nproc*map->npix*sizeof(actData)>tod->ndata*tod->ndet*sizeof(int)) {
     //printf("doing index-saving projection.\n");
     tod2map_nocopy(map,tod,params);
     return;
   }
   //else
-  // printf("doing old projection.\n");
+  //printf("doing old projection.\n");
 
 
 
@@ -1559,15 +2066,16 @@ void tod2map(MAP *map, mbTOD *tod, PARAMS *params)
   }
 #pragma omp parallel shared(tod,map,params) default(none)
   { 
-
-    MAP *mymap=make_blank_map_copy(map);
+    MAP *mymap=make_blank_map_copy(map);    
     int *ind=(int *)malloc_retry(sizeof(int)*tod->ndata);
-    PointingFitScratch *scratch=allocate_pointing_fit_scratch(tod);
 
+    PointingFitScratch *scratch=allocate_pointing_fit_scratch(tod);
 #pragma omp for nowait
     for (int i=0;i<tod->ndet;i++) { 
       if ((!mbCutsIsAlwaysCut(tod->cuts,tod->rows[i],tod->cols[i]))&&(is_det_listed(tod,params,i))) {
+	//printf("doing first stuff.\n");
 	get_pointing_vec_new(tod,map,i,ind,scratch);
+	//printf("got pointing vec.\n");
 	if (tod->kept_data) {
 	  int row=tod->rows[i];
 	  int col=tod->cols[i];
@@ -1578,6 +2086,7 @@ void tod2map(MAP *map, mbTOD *tod, PARAMS *params)
 	}
 	else {
 	  if (tod->uncuts) {
+	    //printf("doing uncuts.\n");
 	    int row=tod->rows[i];
 	    int col=tod->cols[i];
 	    mbUncut *uncut=tod->uncuts[row][col];
@@ -1592,12 +2101,431 @@ void tod2map(MAP *map, mbTOD *tod, PARAMS *params)
       }
     }
     
+    //printf("ready to accumulate.\n");
     
     omp_reduce_map(map,mymap);
     free(ind);
     destroy_pointing_fit_scratch(scratch);
     destroy_map(mymap);
   } 
+}
+/*--------------------------------------------------------------------------------*/
+void polmap2tod_old(MAP *map, mbTOD *tod)
+{
+  assert(tod);
+  assert(tod->data);
+  assert(tod->pixelization_saved);
+  int cur_pol=0;
+  //loop through possible polarization states and project the ones we find.
+  for (int pol_ind=0;pol_ind<MAX_NPOL;pol_ind++)
+    if (map->pol_state[pol_ind]) {
+      if (pol_ind==0) {  //I 
+#pragma omp parallel shared(pol_ind,map,tod,cur_pol)
+	for (int det=0;det<tod->ndet;det++) {
+	  int row=tod->rows[det];
+	  int col=tod->cols[det];
+	  mbUncut *uncut=tod->uncuts[row][col];
+	  for (int region=0;region<uncut->nregions;region++)
+	    for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++)
+	      tod->data[det][j]+=map->map[tod->pixelization_saved[det][j]];
+	}
+	cur_pol++;
+      }
+      if (pol_ind==1) {  //Q
+#pragma omp parallel shared(pol_ind,map,tod,cur_pol)
+        for (int det=0;det<tod->ndet;det++) {
+          int row=tod->rows[det];
+          int col=tod->cols[det];
+          mbUncut *uncut=tod->uncuts[row][col];
+          for (int region=0;region<uncut->nregions;region++)
+            for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++)
+              tod->data[det][j]+=map->map[tod->pixelization_saved[det][j]+cur_pol*map->npix]*sin(tod->twogamma_saved[det][j]);
+	}
+	cur_pol++;
+      }
+      if (pol_ind==2) {  //U
+#pragma omp parallel shared(pol_ind,map,tod,cur_pol)
+        for (int det=0;det<tod->ndet;det++) {
+          int row=tod->rows[det];
+          int col=tod->cols[det];
+          mbUncut *uncut=tod->uncuts[row][col];
+          for (int region=0;region<uncut->nregions;region++)
+            for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++)
+              tod->data[det][j]+=map->map[tod->pixelization_saved[det][j]+cur_pol*map->npix]*cos(tod->twogamma_saved[det][j]);
+	}
+	cur_pol++;
+      }
+      
+    }
+}
+/*--------------------------------------------------------------------------------*/
+
+void polmap2tod(MAP *map, mbTOD *tod)
+{
+  assert(tod);
+  assert(tod->data);
+  assert(tod->pixelization_saved);
+  assert(tod->uncuts);
+
+
+  const int npol=get_npol_in_map(map);
+  const int poltag=get_map_poltag(map);
+  const int npix=map->npix;
+  if (poltag==POL_ERROR) {
+    fprintf(stderr,"Error - unrecognized combination in polmap2tod.\n");
+    return;
+  }
+#pragma omp parallel shared(map,tod) default(none)
+  {
+    
+    const ACTpolPointingFit *pfit=tod->actpol_pointing;
+    const actData *az=tod->az;
+    actData ninv=1.0/tod->ndata;
+
+
+    const actData *mymap=map->map;
+    switch(poltag){
+    case POL_I:
+#pragma omp for
+      for (int det=0;det<tod->ndet;det++) {
+	int row=tod->rows[det];
+	int col=tod->cols[det];
+	mbUncut *uncut=tod->uncuts[row][col];
+	for (int region=0;region<uncut->nregions;region++) {
+	  for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++)
+	    tod->data[det][j]+=mymap[tod->pixelization_saved[det][j]];
+	}
+      }
+      break;
+    case POL_IQU:
+#pragma omp for
+      for (int det=0;det<tod->ndet;det++) {
+	actData ctime_sin=pfit->gamma_ctime_sin_coeffs[det]*ninv;
+	actData ctime_cos=pfit->gamma_ctime_cos_coeffs[det]*ninv;
+	const actData *az_sin=pfit->gamma_az_sin_coeffs[det];
+	const actData *az_cos=pfit->gamma_az_cos_coeffs[det];
+
+	int row=tod->rows[det];
+	int col=tod->cols[det];
+	mbUncut *uncut=tod->uncuts[row][col];
+	for (int region=0;region<uncut->nregions;region++) {
+	  for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++){
+
+	    actData mysin,mycos;
+	    actData aa=az[j];
+	    mysin=az_sin[3]+aa*(az_sin[2]+aa*(az_sin[1]+aa*(az_sin[0])))+ctime_sin*j;
+	    mycos=az_cos[3]+aa*(az_cos[2]+aa*(az_cos[1]+aa*(az_cos[0])))+ctime_cos*j;
+
+	    int jj=tod->pixelization_saved[det][j]*npol;
+	    tod->data[det][j]+=mymap[jj];
+	    tod->data[det][j]+=mymap[jj+1]*mycos;
+	    tod->data[det][j]+=mymap[jj+2]*mysin;
+	  }
+	}
+      }
+      break;
+    case POL_QU:
+#pragma omp for
+      for (int det=0;det<tod->ndet;det++) {
+	int row=tod->rows[det];
+	int col=tod->cols[det];
+	mbUncut *uncut=tod->uncuts[row][col];
+	for (int region=0;region<uncut->nregions;region++) {
+	  for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++){
+	    actData mycos=cos7_pi(tod->twogamma_saved[det][j]);
+	    actData mysin=sin7_pi(tod->twogamma_saved[det][j]);
+	    int jj=tod->pixelization_saved[det][j]*npol;
+	    tod->data[det][j]+=mymap[jj]*mycos;
+	    tod->data[det][j]+=mymap[jj+1]*mysin;
+	  }
+	}
+      }
+      break;
+    default:
+      printf("Error - unsupported poltag in polmap2tod.\n");
+      break;
+    }
+  }
+}
+
+/*--------------------------------------------------------------------------------*/
+void tod2polmap(MAP *map,mbTOD *tod)
+{
+  assert(tod);
+  assert(tod->data);
+  assert(tod->pixelization_saved);
+  assert(tod->uncuts);
+  int cur_pol=0;
+  //loop through possible polarization states and project the ones we find.
+  for (int pol_ind=0;pol_ind<MAX_NPOL;pol_ind++)
+    if (map->pol_state[pol_ind]) {
+      if (pol_ind==0) {  //I 
+#pragma omp parallel for shared(pol_ind,map,tod,cur_pol)
+	for (int det=0;det<tod->ndet;det++) {
+	  int row=tod->rows[det];
+	  int col=tod->cols[det];
+	  mbUncut *uncut=tod->uncuts[row][col];
+	  for (int region=0;region<uncut->nregions;region++) {
+	    for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++)
+#pragma omp atomic
+	      map->map[tod->pixelization_saved[det][j]]+=tod->data[det][j];
+	  }
+	}
+	cur_pol++;
+      }
+      if (pol_ind==1) {  //Q
+#pragma omp parallel shared(pol_ind,map,tod,cur_pol)
+        for (int det=0;det<tod->ndet;det++) {
+          int row=tod->rows[det];
+          int col=tod->cols[det];
+          mbUncut *uncut=tod->uncuts[row][col];
+          for (int region=0;region<uncut->nregions;region++)
+            for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++)
+#pragma omp atomic
+	      map->map[tod->pixelization_saved[det][j]+cur_pol*map->npix]+=tod->data[det][j]*sin(tod->twogamma_saved[det][j]);
+	}
+	cur_pol++;
+      }
+      if (pol_ind==2) {  //U
+#pragma omp parallel shared(pol_ind,map,tod,cur_pol)
+        for (int det=0;det<tod->ndet;det++) {
+          int row=tod->rows[det];
+          int col=tod->cols[det];
+          mbUncut *uncut=tod->uncuts[row][col];
+          for (int region=0;region<uncut->nregions;region++)
+            for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++)
+#pragma omp atomic
+	      map->map[tod->pixelization_saved[det][j]+cur_pol*map->npix]+=tod->data[det][j]*cos(tod->twogamma_saved[det][j]);
+	}
+	cur_pol++;
+      }
+      if (pol_ind==3) {  //Q^2
+#pragma omp parallel shared(pol_ind,map,tod,cur_pol)
+        for (int det=0;det<tod->ndet;det++) {
+          int row=tod->rows[det];
+          int col=tod->cols[det];
+          mbUncut *uncut=tod->uncuts[row][col];
+          for (int region=0;region<uncut->nregions;region++)
+            for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++) {
+	      actData mycos=cos(tod->twogamma_saved[det][j]);
+#pragma omp atomic
+	      map->map[tod->pixelization_saved[det][j]+cur_pol*map->npix]+=tod->data[det][j]*mycos*mycos;
+	    }
+	}
+	cur_pol++;
+      }
+
+      if (pol_ind==4) {  //Q*U
+#pragma omp parallel shared(pol_ind,map,tod,cur_pol)
+        for (int det=0;det<tod->ndet;det++) {
+          int row=tod->rows[det];
+          int col=tod->cols[det];
+          mbUncut *uncut=tod->uncuts[row][col];
+          for (int region=0;region<uncut->nregions;region++)
+            for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++) {
+	      actData mycos=cos(tod->twogamma_saved[det][j]);
+	      actData mysin=sin(tod->twogamma_saved[det][j]);
+#pragma omp atomic
+	      map->map[tod->pixelization_saved[det][j]+cur_pol*map->npix]+=tod->data[det][j]*mycos*mysin;
+	    }
+	}
+	cur_pol++;
+      }
+      
+      if (pol_ind==5) {  //U^2
+#pragma omp parallel shared(pol_ind,map,tod,cur_pol)
+        for (int det=0;det<tod->ndet;det++) {
+          int row=tod->rows[det];
+          int col=tod->cols[det];
+          mbUncut *uncut=tod->uncuts[row][col];
+          for (int region=0;region<uncut->nregions;region++)
+            for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++) {
+	      actData mysin=sin(tod->twogamma_saved[det][j]);
+#pragma omp atomic
+	      map->map[tod->pixelization_saved[det][j]+cur_pol*map->npix]+=tod->data[det][j]*mysin*mysin;
+	    }
+	}
+	cur_pol++;
+      }
+      
+    }
+}
+/*--------------------------------------------------------------------------------*/
+static inline void get_twogamma_sincos(actData *sinval, actData *cosval, const actData *sin_azparams, const actData *cos_azparams, int nazparams, actData az,actData sin_tvec_param, actData cos_tvec_param,actData tfrac)
+{
+  *sinval=0;
+  *cosval=0;
+  for (int i=0;i<4;i++) {
+    *sinval=sin_azparams[i]+az*(*sinval);
+    *cosval=cos_azparams[i]+az*(*cosval);
+  }
+  *sinval+=sin_tvec_param*tfrac;
+  *cosval+=cos_tvec_param*tfrac;
+}
+/*--------------------------------------------------------------------------------*/
+
+void tod2polmap_copy(MAP *map,mbTOD *tod) 
+//copy refers to each thread having a copy of the map.  
+{
+  assert(tod);
+  assert(tod->data);
+  assert(tod->pixelization_saved);
+  assert(tod->uncuts);
+
+  const int npol=get_npol_in_map(map);
+  const int poltag=get_map_poltag(map);
+  const int npix=map->npix;
+
+  if (poltag==POL_ERROR) {
+    fprintf(stderr,"Error - unrecognized combination in tod2polmap_copy.\n");
+    return;
+  }
+#pragma omp parallel shared(map,tod) default(none)
+  {
+    actData mysin,mycos;
+    const ACTpolPointingFit *pfit=tod->actpol_pointing;
+    const actData *az=tod->az;
+    actData *mymap=vector(npol*map->npix);
+    actData ninv=1.0/tod->ndata;
+    memset(mymap,0,npol*map->npix*sizeof(actData));
+    switch(poltag){
+    case POL_I: 
+#pragma omp for
+      for (int det=0;det<tod->ndet;det++) {
+	int row=tod->rows[det];
+	int col=tod->cols[det];
+	mbUncut *uncut=tod->uncuts[row][col];
+	for (int region=0;region<uncut->nregions;region++) {
+	  for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++)
+	    mymap[tod->pixelization_saved[det][j]]+=tod->data[det][j];	  
+	}
+      }
+      break;
+    case POL_IQU:
+#pragma omp for
+      for (int det=0;det<tod->ndet;det++) {
+
+	actData ctime_sin=pfit->gamma_ctime_sin_coeffs[det]*ninv;
+	actData ctime_cos=pfit->gamma_ctime_cos_coeffs[det]*ninv;
+	const actData *az_sin=pfit->gamma_az_sin_coeffs[det];
+	const actData *az_cos=pfit->gamma_az_cos_coeffs[det];
+
+	int row=tod->rows[det];
+	int col=tod->cols[det];
+	mbUncut *uncut=tod->uncuts[row][col];
+	for (int region=0;region<uncut->nregions;region++) {
+	  for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++){
+	    
+	    //get_twogamma_sincos(&mysin,&mycos,pfit->gamma_az_sin_coeffs[det],pfit->gamma_az_cos_coeffs[det],pfit->n_gamma_az_coeffs,tod->az[j],pfit->gamma_ctime_sin_coeffs[det],pfit->gamma_ctime_cos_coeffs[det],j*ninv);
+	    actData aa=az[j];
+	    mysin=az_sin[3]+aa*(az_sin[2]+aa*(az_sin[1]+aa*(az_sin[0])))+ctime_sin*j;
+	    mycos=az_cos[3]+aa*(az_cos[2]+aa*(az_cos[1]+aa*(az_cos[0])))+ctime_cos*j;
+
+	    int jj=tod->pixelization_saved[det][j]*npol;
+	    mymap[jj]+=tod->data[det][j];
+	    mymap[jj+1]+=tod->data[det][j]*mycos;
+	    mymap[jj+2]+=tod->data[det][j]*mysin;
+
+	  }
+	}
+      }
+      break;
+
+    case POL_QU:
+#pragma omp for
+      for (int det=0;det<tod->ndet;det++) {
+	int row=tod->rows[det];
+	int col=tod->cols[det];
+	mbUncut *uncut=tod->uncuts[row][col];
+	for (int region=0;region<uncut->nregions;region++) {
+	  for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++){
+#if 1
+	    actData mycos=cos7_pi(tod->twogamma_saved[det][j]);
+	    actData mysin=sin7_pi(tod->twogamma_saved[det][j]);
+	    int jj=tod->pixelization_saved[det][j]*npol;
+	    mymap[jj]+=tod->data[det][j]*mycos;
+	    mymap[jj+1]+=tod->data[det][j]*mysin;
+	    
+#else
+	    mymap[tod->pixelization_saved[det][j]]+=tod->data[det][j]*cos(tod->twogamma_saved[det][j]);
+	    mymap[tod->pixelization_saved[det][j]+npix]+=tod->data[det][j]*sin(tod->twogamma_saved[det][j]);
+#endif
+	  }
+	}
+      }
+      break;
+
+    case POL_IQU_PRECON:
+#pragma omp for
+      for (int det=0;det<tod->ndet;det++) {
+	actData ctime_sin=pfit->gamma_ctime_sin_coeffs[det]*ninv;
+	actData ctime_cos=pfit->gamma_ctime_cos_coeffs[det]*ninv;
+	const actData *az_sin=pfit->gamma_az_sin_coeffs[det];
+	const actData *az_cos=pfit->gamma_az_cos_coeffs[det];
+
+	int row=tod->rows[det];
+	int col=tod->cols[det];
+	mbUncut *uncut=tod->uncuts[row][col];
+	for (int region=0;region<uncut->nregions;region++) {
+	  for (int j=uncut->indexFirst[region];j<uncut->indexLast[region];j++){
+
+	    //get_twogamma_sincos(&mysin,&mycos,pfit->gamma_az_sin_coeffs[det],pfit->gamma_az_cos_coeffs[det],pfit->n_gamma_az_coeffs,tod->az[j],pfit->gamma_ctime_sin_coeffs[det],pfit->gamma_ctime_cos_coeffs[det],j*ninv);
+	    actData aa=az[j];
+	    mysin=az_sin[3]+aa*(az_sin[2]+aa*(az_sin[1]+aa*(az_sin[0])))+ctime_sin*j;
+	    mycos=az_cos[3]+aa*(az_cos[2]+aa*(az_cos[1]+aa*(az_cos[0])))+ctime_cos*j;
+	    
+	    actData mycos=cos7_pi(tod->twogamma_saved[det][j]);
+	    actData mysin=sin7_pi(tod->twogamma_saved[det][j]);
+
+	    int jj=tod->pixelization_saved[det][j]*npol;
+	    
+	    mymap[jj]+=tod->data[det][j];
+	    mymap[jj+1]+=tod->data[det][j]*mycos;
+	    mymap[jj+2]+=tod->data[det][j]*mysin;
+	    mymap[jj+3]+=tod->data[det][j]*mycos*mycos;
+	    mymap[jj+4]+=tod->data[det][j]*mycos*mysin;
+	    mymap[jj+5]+=tod->data[det][j]*mysin*mysin;
+
+	  }
+	}
+      }
+      break;
+    default:  //should never get here, as error should have already triggered above.
+      printf("Error - Don't know how to deal with map polarization in tod2polmap_copy.\n");
+      break;
+    }
+#pragma omp critical(reduce_first)
+    for (int i=0;i<npix;i++) {
+      map->map[i]+=mymap[i];
+    }
+    if (npol>=2) {
+#pragma omp critical(reduce_second)
+      for (int i=npix;i<2*npix;i++) 
+	map->map[i]+=mymap[i];
+    }    
+    if (npol>=3) {
+#pragma omp critical(reduce_third)
+      for (int i=2*npix;i<3*npix;i++) 
+	map->map[i]+=mymap[i];
+    }    
+    if (npol>=4) {
+#pragma omp critical(reduce_fourth)
+      for (int i=3*npix;i<4*npix;i++) 
+	map->map[i]+=mymap[i];
+    }    
+    if (npol>=5) {
+#pragma omp critical(reduce_fifth)
+      for (int i=4*npix;i<5*npix;i++) 
+	map->map[i]+=mymap[i];
+    }    
+    if (npol>=6) {
+#pragma omp critical(reduce_sixth)
+      for (int i=5*npix;i<6*npix;i++) 
+	map->map[i]+=mymap[i];
+    }    
+    
+    free(mymap);
+  }
 }
 /*--------------------------------------------------------------------------------*/
 
@@ -1724,6 +2652,10 @@ void calculate_avec(mbTOD *tod, int mydet, actData *avec)
 /*--------------------------------------------------------------------------------*/
 int cutvec2tod(mbTOD *tod, actData *cutvec)
 {
+  if (tod->cuts_fit_params) {
+    //if cuts are paramaterized by polynomials instead of full cutvecs, behave properly.
+    return cutpolys2tod(tod,cutvec);
+  }
   if (!tod->have_data) {
     fprintf(stderr,"missing data in tod in cutvec2tod\n");
     return 1;
@@ -1754,6 +2686,11 @@ int cutvec2tod(mbTOD *tod, actData *cutvec)
 /*--------------------------------------------------------------------------------*/
 int tod2cutvec(mbTOD *tod, actData *cutvec)
 {
+
+  if (tod->cuts_fit_params) {
+    //if cuts are paramaterized by polynomials instead of full cutvecs, behave properly.
+    return tod2cutpolys(tod,cutvec);
+  }
   //printf("greetings from tod2cutvec.\n");
   if (!tod->have_data) {
     fprintf(stderr,"missing data in tod in tod2cutvec\n");
@@ -1779,17 +2716,137 @@ int tod2cutvec(mbTOD *tod, actData *cutvec)
     }
   return 0;
 }
+/*--------------------------------------------------------------------------------*/
+int _get_npol_in_state(const int *pol_state)
+{
+#ifdef ACTPOL
+  int tot=0;
+  for (int i=0;i<MAX_NPOL;i++)
+    if (pol_state[i])
+      tot++;
+  //if (tot==0)
+  // tot=1;  //We probably meant to have TT
+ 
+  return tot;
+#else
+  return 1;
+#endif
+  
+  
+}
+/*--------------------------------------------------------------------------------*/
+int get_npol_in_map(const MAP *map)
+{
+#ifdef ACTPOL
+  const int *ptr=map->pol_state;//&(map->pol_state[0]);
+  return _get_npol_in_state(ptr);
+#else
+  return 1;
+#endif
+}
+/*--------------------------------------------------------------------------------*/
+int get_map_poltag(const MAP *map)
+{
+#ifdef ACTPOL
+  if (map->pol_state==NULL)
+    return POL_I;
 
+
+
+  const int *ptr=map->pol_state;
+  
+  int pol_i[MAX_NPOL]={1,0,0,0,0,0};
+  if (memcmp(ptr,pol_i,sizeof(int)*MAX_NPOL)==0)
+    return POL_I;
+  
+  int pol_iqu[MAX_NPOL]={1,1,1,0,0,0};
+  if (memcmp(ptr,pol_iqu,sizeof(int)*MAX_NPOL)==0)
+    return POL_IQU;
+
+  int pol_qu[MAX_NPOL]={0,1,1,0,0,0};
+  if (memcmp(ptr,pol_qu,sizeof(int)*MAX_NPOL)==0)
+    return POL_QU;
+
+  int pol_iqu_precon[MAX_NPOL]={1,1,1,1,1,1};
+  if (memcmp(ptr,pol_iqu_precon,sizeof(int)*MAX_NPOL)==0)
+    return POL_IQU_PRECON;
+
+  int pol_qu_precon[MAX_NPOL]={0,0,0,1,1,1};
+  if (memcmp(ptr,pol_qu_precon,sizeof(int)*MAX_NPOL)==0)
+    return POL_QU_PRECON;
+  
+#else
+  return POL_I;
+#endif
+  printf("Unknown polarization configuration in get_map_poltag.\n");
+  return POL_ERROR;
+}
+/*--------------------------------------------------------------------------------*/
+#ifdef ACTPOL
+void set_map_polstate(MAP *map, int *pol_state)
+{
+  int old_npol=get_npol_in_map(map);
+  int new_npol=_get_npol_in_state(pol_state);
+  
+  actData **new_map=matrix(new_npol,map->npix);
+  memset(new_map[0],0,sizeof(actData)*new_npol*map->npix);
+  if (map->map) {
+    int old_ind=0;
+    int new_ind=0;
+    for (int i=0;i<MAX_NPOL;i++) {
+      if ((map->pol_state[i])&&(pol_state[i])) 
+	memcpy(new_map[new_ind],&(map->map[old_ind*map->npix]),map->npix*sizeof(actData));
+      if (map->pol_state[i])
+	old_ind++;
+      if (pol_state[i])
+	new_ind++;
+    }
+    free(map->map);
+    map->map=new_map[0];
+    free(new_map);  //only freeing the pointer to the pointers, keeping the actual address saved.
+    memcpy(map->pol_state,pol_state,sizeof(pol_state[0])*MAX_NPOL);
+  }
+}
+#endif
 /*--------------------------------------------------------------------------------*/
 void map2det(const MAP *map, const mbTOD *tod, actData *vec, int *ind, int det, PointingFitScratch *scratch)
 //add a map into a vector.
 {
   //get_pointing_vec(tod,map,det,ind);
   get_pointing_vec_new(tod,map,det,ind,scratch);
-  
+  //#ifdef ACTPOL
+#if 0
+  switch(map->pol_state) {
+  case 0:
+  case 1:
+    for (int j=0;j<tod->ndata;j++) {
+      vec[j]+=map->map[ind[j]];      
+    }
+    break;
+  case 2:  //maps are only (Q,U)
+    for (int j=0;j<tod->ndata;j++) {
+      vec[j]+=map->map[2*ind[j]]*scratch->cos2gamma[j];
+      vec[j]+=map->map[2*ind[j]+1]*scratch->sin2gamma[j];
+    }
+    break;
+  case 3:  //maps are (I,Q,U)
+    for (int j=0;j<tod->ndata;j++) {
+      vec[j]+=map->map[3*ind[j]];
+      vec[j]+=map->map[3*ind[j]+1]*scratch->cos2gamma[j];
+      vec[j]+=map->map[3*ind[j]+2]*scratch->sin2gamma[j];      
+      
+    }
+    break;
+  default:
+    assert(1==0);  //this means we had an unrecognized map type.
+    break;
+  }
+#else
   for (int j=0;j<tod->ndata;j++) {
     vec[j]+=map->map[ind[j]];
   }
+#endif
+
   
 } 
 /*--------------------------------------------------------------------------------*/
@@ -1855,6 +2912,7 @@ void map2tod(const MAP *map, mbTOD *tod,const PARAMS *params)
 {
   
   assert(tod->have_data);
+
   actData scale_fac=1.0;
   if (params)
     scale_fac=*((actData *)params);
@@ -2678,7 +3736,7 @@ void copy_map2map(MAP *map2, MAP *map)
 {
   assert(map->npix==map2->npix);
   assert(map->npix>0);
-  memcpy(map2->map,map->map,sizeof(actData)*map->npix);
+  memcpy(map2->map,map->map,sizeof(actData)*map->npix*get_npol_in_map(map));
 }
 /*--------------------------------------------------------------------------------*/
 void copy_mapset2mapset(MAPvec *map2, MAPvec *map)
@@ -3297,3 +4355,89 @@ void get_data_corrs(mbTOD *tod)
 
 
  }
+/*--------------------------------------------------------------------------------*/
+void invert_pol_precon(MAP *map)
+{
+  int poltag=get_map_poltag(map);
+#pragma omp parallel shared(map,poltag) default(none)
+  {
+    actData *mm=map->map;
+    switch(poltag){
+    case POL_IQU_PRECON:  {
+      actData **mymat=matrix(3,3);
+#pragma omp for 
+      for (int i=0;i<map->npix;i++)  {
+	int ii=i*6; //6 polarization in this map
+	if (mm[ii]>0) {
+	  mymat[0][0]=mm[ii];
+	  mymat[0][1]=mymat[1][0]=mm[ii+1]; //Q 
+	  mymat[0][2]=mymat[2][0]=mm[ii+2]; //U
+	  mymat[1][1]=mm[ii+3];             //Q^2
+	  mymat[1][2]=mymat[2][1]=mm[ii+4]; //Q*U
+	  mymat[2][2]=mm[ii+5];             //U^2
+	  invert_posdef_mat(mymat,3);
+	  mm[ii]=mymat[0][0];
+	  mm[ii+1]=mymat[0][1];
+	  mm[ii+2]=mymat[0][2];
+	  mm[ii+3]=mymat[1][1];
+	  mm[ii+4]=mymat[1][2];
+	  mm[ii+5]=mymat[2][2];
+	}
+      }
+      free(mymat[0]);
+      free(mymat);
+      break;
+    }
+    default:
+      printf("Not set up yet in invert_pol_precon.  you may have some code to write...\n");
+      break;
+    }
+          
+  }
+}
+
+/*--------------------------------------------------------------------------------*/
+void apply_pol_precon(MAP *map, MAP *precon)
+{
+  int poltag=get_map_poltag(map);
+  int precontag=get_map_poltag(precon);
+  if (poltag==POL_IQU) 
+    if (precontag!=POL_IQU_PRECON) {
+      fprintf(stderr,"ERror in apply_pol_precon - preconditioner is not appropriate for the IQU map.\n");
+      return;
+    }
+  if (poltag==POL_QU) 
+    if (precontag!=POL_QU_PRECON) {
+      fprintf(stderr,"Error in apply_pol_precon - preconditioner is not appropriate for the QU map.\n");
+      return;
+    }
+  
+#pragma omp parallel shared(map,precon,poltag) default(none)
+  {
+    actData *mm=map->map;
+    actData *pp=precon->map;
+    switch(poltag){
+    case POL_IQU:  {
+#pragma omp for schedule(static,512)
+      for (int i=0;i<map->npix;i++)  {
+	int im=i*3; //3 pols in map;
+	int ip=i*6; //6 pols in precon;
+	//just multiplying a 3x3 matrix in precon by a 3 element vector in map, but precon only stores half the matrix, 
+	//so indexing can look a little hairy
+	actData tmp1=mm[im]*pp[ip]+mm[im+1]*pp[ip+1]+mm[im+2]*pp[ip+2];
+	actData tmp2=mm[im]*pp[ip+1]+mm[im+1]*pp[ip+3]+mm[im+2]*pp[ip+4];
+	actData tmp3=mm[im]*pp[ip+2]+mm[im+1]*pp[ip+4]+mm[im+2]*pp[ip+5];
+	mm[im]=tmp1;
+	mm[im+1]=tmp2;
+	mm[im+2]=tmp3;
+	
+      }
+      
+    }
+      break;
+    default:
+      printf("Don't have polarization written up in apply_pol_precon.  You probably have some coding to do.\n");
+      break;
+    }
+  }
+}

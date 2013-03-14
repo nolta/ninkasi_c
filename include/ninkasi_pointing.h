@@ -1,8 +1,14 @@
 #ifndef NINKASI_POINTING_H
 #define NINKASI_POINTING_H
+#ifndef MAKEFILE_HAND
 #include "config.h"
+#endif
 #include "ninkasi.h"
 #include "ninkasi_mathutils.h"
+
+#define NINKASI_DO_RADEC 1
+#define NINKASI_DO_TWOGAMMA 2
+
 
 typedef struct {
   actData *ra;
@@ -17,9 +23,18 @@ typedef struct {
   actData *ra_coarse;
   actData *dec_coarse;
   actData *time_coarse;
+
+#ifdef ACTPOL
+  actData *sin2gamma;
+  actData *cos2gamma;
+  actData *sin2gamma_coarse;
+  actData *cos2gamma_coarse;
+#endif
+
   PointingFit *pointing_fit; 
 } PointingFitScratch;
 
+/*--------------------------------------------------------------------------------*/
 
 void destroy_pointing_fit_raw(PointingFit *fit);
 void destroy_pointing_fit(mbTOD *tod);
@@ -51,6 +66,18 @@ void shift_tod_pointing(mbTOD *tod, actData ra_shift, actData dec_shift);
 int act_observed_altaz_to_mean_radec( const Site *site, double freq_GHz,
         int n, const double ctime[], const actData alt[], const actData az[],
 				      actData ra[], actData dec[] );
+#ifdef ACTPOL
+ACTpolPointingFit *initialize_actpol_pointing(mbTOD *tod, actData *dx, actData *dy, actData *angle, actData freq,int dpiv);
+ACTpolPointingFit *update_actpol_pointing(mbTOD *tod, actData *dx, actData *dy, actData *angle, actData freq,int dpiv);
+void precalc_actpol_pointing_exact(mbTOD *tod,int op_flag);
+void precalc_actpol_pointing(mbTOD *tod);
+void precalc_actpol_pointing_free(mbTOD *tod);
+void find_tod_radec_lims_actpol_pointing_exact(mbTOD *tod,actData rawrap);
+void get_radec_one_det_actpol(mbTOD *tod,int det,PointingFitScratch *scratch);
+void get_radec_from_altaz_actpol_c(double *az, double *el, double *tvec, double *dx, double *dy, double *theta, double *ra, double *dec, int nhorns, int nt);
 
 
 #endif
+
+#endif
+
